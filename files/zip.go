@@ -71,6 +71,10 @@ func ZipFileSystemObject(sourceDir, zipFilePath string, compressor CompressionSt
 	}
 	defer zipFile.Close()
 
+	if err := os.Chmod(zipFilePath, 0664); err != nil {
+		return err
+	}
+
 	zipWriter := zip.NewWriter(zipFile)
 	defer zipWriter.Close()
 

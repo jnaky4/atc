@@ -416,6 +416,8 @@ func Deletion(file *FileInfo, details string, isDir bool) error {
 	}
 
 	updateParentSizes(file.Parent, -1*file.Size)
+	updateParentCount(file.Parent, -1)
+
 	return nil
 }
 
@@ -586,6 +588,8 @@ func CopyingFile(selectedFile *FileInfo) {
 	if err != nil {
 		println(err.Error())
 	}
+
+	//todo merge with updateCount and updateSize
 	updateFileSystem(selectedFile, copyPath)
 }
 
@@ -683,6 +687,7 @@ func HandleFileOperation(operation string, selectedFile *FileInfo) {
 		if err != nil {
 			println(err.Error())
 		}
+		updateFileSystem(selectedFile, selectedFile.FullPath+".zip")
 	case string(Delete):
 		err := Deletion(selectedFile, displayFileDetails(selectedFile), false)
 		if err != nil {
@@ -738,6 +743,7 @@ func updateFileSystem(file *FileInfo, newPath string) {
 	targetDir.Files[newFile.Name] = newFile
 	targetDir.SubObjectCount++
 	updateParentSizes(targetDir, newFile.Size)
+
 }
 
 func findTargetDirectory(targetPath string, dir *Directory) *Directory {
@@ -751,6 +757,17 @@ func findTargetDirectory(targetPath string, dir *Directory) *Directory {
 		}
 	}
 	return nil
+}
+
+//func update() {
+//	updateParentSizes(file.Parent, -1*file.Size)
+//	updateParentCount(filepath.HasPre)
+//}
+
+func updateParentCount(dir *Directory, fileCount int64) {
+	for currentDir := dir; currentDir != nil; currentDir = currentDir.Parent {
+		currentDir.SubObjectCount += fileCount
+	}
 }
 
 func updateParentSizes(dir *Directory, fileSize int64) {
