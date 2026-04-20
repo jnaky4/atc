@@ -4,10 +4,21 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT)
+
+	go func() {
+		<-sigChan
+		fmt.Println("Received SIGINT, exiting...")
+		os.Exit(0)
+	}()
 
 	singleCommand()
 	//pipeCommand()

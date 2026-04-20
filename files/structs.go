@@ -47,6 +47,7 @@ const (
 	Copy        Options = "Copy"
 	Delete      Options = "Delete"
 	Move        Options = "Move"
+	Open        Options = "Open"
 	Ownership   Options = "Ownership"
 	Permissions Options = "Permissions"
 	Rename      Options = "Rename"
@@ -63,6 +64,7 @@ func GetDirectoryOptions() []string {
 		string(Copy),
 		string(Delete),
 		string(Move),
+		string(Open),
 		string(Ownership),
 		string(Permissions),
 		string(Rename),
