@@ -8,11 +8,9 @@ import (
 	tc "filesystem/const/terminalColors"
 	t "filesystem/time_completion"
 	"fmt"
-	"github.com/chzyer/readline"
-	"github.com/eiannone/keyboard"
-	"gopkg.in/yaml.v3"
 	"io"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
@@ -21,6 +19,10 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/chzyer/readline"
+	"github.com/eiannone/keyboard"
+	"gopkg.in/yaml.v3"
 )
 
 func ParseFile(fullPath string, parent *Directory) (*FileInfo, error) {
@@ -260,7 +262,7 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 				prevSelected = selected
 				selected = 0
 			}
-		case keyboard.KeyArrowLeft: //todo only works going back 1 layer
+		case keyboard.KeyArrowLeft:
 			if currentDir.Parent != nil {
 				currentDir = currentDir.Parent
 				if len(currentDir.Subdirectories)+len(currentDir.Files) > prevSelected {
@@ -268,7 +270,25 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 				} else {
 					selected = 0
 				}
-
+			} else {
+				// Navigate past root: build parent directory
+				parentPath := filepath.Dir(currentDir.FullPath)
+				if parentPath != currentDir.FullPath && parentPath != "." {
+					parentDir, err := ParseDirectory(parentPath, nil)
+					if err == nil {
+						parentDir.Subdirectories = make(map[string]*Directory)
+						parentDir.Files = make(map[string]*FileInfo)
+						// Populate subdirectories and files for the parent
+						_, _, err = BuildDirectoryRecursion(parentDir)
+						if err == nil {
+							// Set current dir as child of parent
+							parentDir.Subdirectories[currentDir.Name] = currentDir
+							currentDir.Parent = parentDir
+							currentDir = parentDir
+							selected = 0
+						}
+					}
+				}
 			}
 		case keyboard.KeyEnter:
 			selectedItem := orderedSubFiles[selected]
@@ -643,6 +663,25 @@ func PlaceHolderInput(prompt string, placeHolder string) string {
 	return input
 }
 
+func OpenWithDefault(path string) error {
+	var cmd *exec.Cmd
+	// Prefer VS Code if available
+	if _, err := exec.LookPath("code"); err == nil {
+		cmd = exec.Command("code", path)
+	} else {
+		// Fall back to OS default
+		switch runtime.GOOS {
+		case "windows":
+			cmd = exec.Command("cmd", "/c", "start", path)
+		case "darwin":
+			cmd = exec.Command("open", path)
+		default: // linux and others
+			cmd = exec.Command("xdg-open", path)
+		}
+	}
+	return cmd.Start()
+}
+
 func HandleDirOperation(operation string, dir *Directory) {
 	switch operation {
 	case string(Zip):
@@ -662,6 +701,11 @@ func HandleDirOperation(operation string, dir *Directory) {
 		CopyingFolder(dir)
 	case string(Backup):
 	case string(Compare):
+	case string(Open):
+		err := OpenWithDefault(dir.FullPath)
+		if err != nil {
+			println(err.Error())
+		}
 	case string(Ownership):
 	case string(Permissions):
 		//todo not windows compatible
@@ -699,6 +743,11 @@ func HandleFileOperation(operation string, selectedFile *FileInfo) {
 		CopyingFile(selectedFile)
 	case string(Permissions):
 		err := SetPermissions(selectedFile)
+		if err != nil {
+			println(err.Error())
+		}
+	case string(Open):
+		err := OpenWithDefault(selectedFile.FullPath)
 		if err != nil {
 			println(err.Error())
 		}
