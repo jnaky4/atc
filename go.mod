@@ -1,6 +1,6 @@
 module filesystem
 
-go 1.23
+go 1.25.0
 
 require (
 	github.com/andybalholm/brotli v1.1.1
@@ -15,5 +15,6 @@ require (
 require (
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect
-	golang.org/x/sys v0.12.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/term v0.42.0 // indirect
 )

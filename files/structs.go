@@ -21,6 +21,7 @@ type FileInfo struct {
 	FullPath    string
 	Target      string
 	Parent      *Directory
+	Unreadable  bool
 }
 
 type Directory struct {
