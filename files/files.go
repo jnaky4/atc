@@ -18,12 +18,19 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/chzyer/readline"
 	"github.com/eiannone/keyboard"
+	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
+
+// directoryCache stores already-calculated directory structures to avoid recalculation
+var directoryCache = make(map[string]*Directory)
+var cacheMutex sync.RWMutex
+var logLevel = "error"
 
 func ParseFile(fullPath string, parent *Directory) (*FileInfo, error) {
 	fi, err := os.Stat(fullPath)
@@ -82,13 +89,29 @@ func BuildDirectoryStructure(dirPath string) (*Directory, error) {
 	//}
 
 	startDir.Size, startDir.SubObjectCount, err = BuildDirectoryRecursion(startDir)
+
+	// Cache the built directory and its subdirectories
+	cacheDirectoryTree(startDir)
+
 	return startDir, nil
 }
 
 func BuildDirectoryRecursion(dir *Directory) (int64, int64, error) {
+	var currentStat unix.Statfs_t
+	err := unix.Statfs(dir.FullPath, &currentStat)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to statfs directory %s: %w", dir.FullPath, err)
+	}
+	dev := currentStat.Fsid.Val
+
 	dirEntries, err := os.ReadDir(dir.FullPath)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to read directory %s: %w", dir.FullPath, err)
+		// Mark as unreadable instead of returning error
+		dir.Unreadable = true
+		if logLevel == "warn" {
+			fmt.Printf("Failed to read directory: %s, error: %v\n", dir.FullPath, err)
+		}
+		return 0, 0, nil
 	}
 
 	var totalSize int64
@@ -124,23 +147,61 @@ func BuildDirectoryRecursion(dir *Directory) (int64, int64, error) {
 		}
 
 		if fi.IsDir() {
-			subDir, _ := ParseDirectory(fullPath, dir)
-
-			subDirSize, subDirCount, err := BuildDirectoryRecursion(subDir)
+			subDir, err := ParseDirectory(fullPath, dir)
 			if err != nil {
-				println(err.Error())
-				continue
+				// Create unreadable dir
+				subDir = &Directory{
+					FileInfo: FileInfo{
+						Name:        fi.Name(),
+						Permissions: "",
+						Owner:       "",
+						Group:       "",
+						Size:        0,
+						ModTime:     fi.ModTime().Unix(),
+						FullPath:    fullPath,
+						Unreadable:  true,
+					},
+					Subdirectories: make(map[string]*Directory),
+					Files:          make(map[string]*FileInfo),
+				}
 			}
-			totalSize += subDirSize
-			totalCount += subDirCount
+
+			var subStat unix.Statfs_t
+			err = unix.Statfs(fullPath, &subStat)
+			if err != nil {
+				subDir.Unreadable = true
+				subDir.Size = 0
+			} else if subStat.Fsid.Val[0] != dev[0] || subStat.Fsid.Val[1] != dev[1] {
+				// Mount point, don't recurse, size 0
+				subDir.Size = 0
+			} else {
+				subDirSize, subDirCount, _ := BuildDirectoryRecursion(subDir)
+				totalSize += subDirSize
+				totalCount += subDirCount
+			}
 
 			dir.Subdirectories[entry.Name()] = subDir
 			continue
 		}
 
 		pfile, err := ParseFile(fullPath, dir)
+		if err != nil {
+			// Create unreadable file info
+			pfile = &FileInfo{
+				Name:        fi.Name(),
+				Permissions: "",
+				Owner:       "",
+				Group:       "",
+				Size:        0,
+				ModTime:     0,
+				FullPath:    fullPath,
+				Unreadable:  true,
+			}
+		}
 		dir.Files[entry.Name()] = pfile
-		totalSize += fi.Size()
+		if !pfile.Unreadable {
+			totalSize += fi.Size()
+		}
 	}
 
 	dirInfo, err := os.Stat(dir.FullPath)
@@ -150,6 +211,77 @@ func BuildDirectoryRecursion(dir *Directory) (int64, int64, error) {
 	dir.Size = totalSize + dirInfo.Size()
 	dir.SubObjectCount = totalCount
 	return totalSize, totalCount, nil
+}
+
+// cacheDirectoryTree recursively caches a directory and all its subdirectories
+func cacheDirectoryTree(dir *Directory) {
+	cacheMutex.Lock()
+	directoryCache[dir.FullPath] = dir
+	cacheMutex.Unlock()
+	for _, subDir := range dir.Subdirectories {
+		cacheDirectoryTree(subDir)
+	}
+}
+
+// preloadParentAndSiblings asynchronously loads parent directory and all its siblings
+func preloadParentAndSiblings(currentDir *Directory) {
+	parentPath := filepath.Dir(currentDir.FullPath)
+	if parentPath == currentDir.FullPath || parentPath == "." {
+		return
+	}
+
+	// Check if already cached
+	cacheMutex.RLock()
+	_, exists := directoryCache[parentPath]
+	cacheMutex.RUnlock()
+	if exists {
+		return
+	}
+
+	go func() {
+		parentDir, err := ParseDirectory(parentPath, nil)
+		if err != nil {
+			return
+		}
+
+		// Build full parent directory structure
+		if _, _, err := BuildDirectoryRecursion(parentDir); err != nil {
+			return
+		}
+
+		// Link current directory to parent if not already linked
+		if currentDir.Parent == nil {
+			parentDir.Subdirectories[currentDir.Name] = currentDir
+			currentDir.Parent = parentDir
+		}
+
+		// Cache the parent and all its subdirectories
+		cacheMutex.Lock()
+		directoryCache[parentPath] = parentDir
+		cacheMutex.Unlock()
+		cacheDirectoryTree(parentDir)
+
+		// Now preload the parent's parent and siblings
+		grandParentPath := filepath.Dir(parentPath)
+		if grandParentPath != parentPath && grandParentPath != "." {
+			go func() {
+				cacheMutex.RLock()
+				_, exists := directoryCache[grandParentPath]
+				cacheMutex.RUnlock()
+				if !exists {
+					grandParent, err := ParseDirectory(grandParentPath, nil)
+					if err == nil {
+						if _, _, err := BuildDirectoryRecursion(grandParent); err == nil {
+							cacheMutex.Lock()
+							directoryCache[grandParentPath] = grandParent
+							cacheMutex.Unlock()
+							cacheDirectoryTree(grandParent)
+						}
+					}
+				}
+			}()
+		}
+	}()
 }
 
 func GetOwner(fi os.FileInfo) string {
@@ -182,35 +314,43 @@ func GetGroup(fi os.FileInfo) string {
 	return "unknown"
 }
 
-func AutoSize(sizeInBits int64) string {
+func AutoSize(sizeInBytes int64) string {
 	switch {
-	case sizeInBits < 1024:
-		return fmt.Sprintf("%d b", sizeInBits) // Bits
-	case sizeInBits < 1024*8:
-		return fmt.Sprintf("%.2f B", float64(sizeInBits)/8) // Bytes
-	case sizeInBits < 1024*1024*8:
-		return fmt.Sprintf("%.2f KB", float64(sizeInBits)/(1024*8))
-	case sizeInBits < 1024*1024*1024*8:
-		return fmt.Sprintf("%.2f MB", float64(sizeInBits)/(1024*1024*8))
-	case sizeInBits < 1024*1024*1024*1024*8:
-		return fmt.Sprintf("%.2f GB", float64(sizeInBits)/(1024*1024*1024*8))
-	case sizeInBits >= 1024*1024*1024*1024*8:
-		return fmt.Sprintf("%.2f TB", float64(sizeInBits)/(1024*1024*1024*1024*8))
+	case sizeInBytes < 1024:
+		return fmt.Sprintf("%d B", sizeInBytes)
+	case sizeInBytes < 1024*1024:
+		return fmt.Sprintf("%.2f KB", float64(sizeInBytes)/1024)
+	case sizeInBytes < 1024*1024*1024:
+		return fmt.Sprintf("%.2f MB", float64(sizeInBytes)/(1024*1024))
+	case sizeInBytes < 1024*1024*1024*1024:
+		return fmt.Sprintf("%.2f GB", float64(sizeInBytes)/(1024*1024*1024))
+	case sizeInBytes >= 1024*1024*1024*1024:
+		return fmt.Sprintf("%.2f TB", float64(sizeInBytes)/(1024*1024*1024*1024))
 	default:
-		return fmt.Sprintf("%d b", sizeInBits) // Default to bits
+		return fmt.Sprintf("%d B", sizeInBytes)
 	}
 }
 
 func getOrderedDirectoryItems(dir *Directory) []string {
-	var items []string
+	var visibleItems []string
+	var hiddenItems []string
 	for name := range dir.Subdirectories {
-		items = append(items, name+"/")
+		if strings.HasPrefix(name, ".") {
+			hiddenItems = append(hiddenItems, name+"/")
+		} else {
+			visibleItems = append(visibleItems, name+"/")
+		}
 	}
 	for name := range dir.Files {
-		items = append(items, name)
+		if strings.HasPrefix(name, ".") {
+			hiddenItems = append(hiddenItems, name)
+		} else {
+			visibleItems = append(visibleItems, name)
+		}
 	}
-	sort.Strings(items)
-	return items
+	sort.Strings(visibleItems)
+	sort.Strings(hiddenItems)
+	return append(visibleItems, hiddenItems...)
 }
 
 func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, error) {
@@ -222,13 +362,19 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 	currentDir := startDir
 	selected := 0
 	prevSelected := 0
+	viewStart := 0
 
 	for {
 		fmt.Print(tc.ClearScreen)
 
-		// Display the parent directory path if available
-		if currentDir.Parent != nil {
-			print(displayDirectoryDetails(currentDir.Parent))
+		if viewStart > 0 {
+			fmt.Println("...")
+		}
+
+		// Display the parent directory path
+		parentPath := filepath.Dir(currentDir.FullPath)
+		if parentPath != currentDir.FullPath && parentPath != "." {
+			fmt.Println(parentPath + "/")
 		}
 
 		// Display current directory details
@@ -236,9 +382,24 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 
 		// Retrieve ordered items for current directory
 		orderedSubFiles := getOrderedDirectoryItems(currentDir)
+		var displayed []string
+		if viewStart > 0 {
+			displayed = append(displayed, "...")
+		}
+		start := viewStart
+		end := min(viewStart+20, len(orderedSubFiles))
+		for i := start; i < end; i++ {
+			displayed = append(displayed, orderedSubFiles[i])
+		}
+		if end < len(orderedSubFiles) {
+			displayed = append(displayed, "...")
+		}
 
 		// Display files and subdirectories with selection indicator
-		displaySortedDirectory(currentDir, orderedSubFiles, selected)
+		displaySortedDirectory(currentDir, displayed, selected)
+
+		// Preload parent and siblings in background for smooth navigation
+		preloadParentAndSiblings(currentDir)
 
 		// Capture keyboard input for navigation
 		_, key, err := keyboard.GetKey()
@@ -248,44 +409,102 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 
 		switch key {
 		case keyboard.KeyArrowUp:
-			if selected > 0 {
+			if selected > 0 && displayed[selected-1] != "..." {
 				selected--
+			} else if displayed[selected] == "..." {
+				// Do nothing
+			} else if viewStart > 0 {
+				viewStart -= 1
+			}
+			if selected > len(displayed)-1 {
+				selected = len(displayed) - 1
 			}
 		case keyboard.KeyArrowDown:
-			if selected < len(orderedSubFiles)-1 {
+			if selected < len(displayed)-1 && displayed[selected+1] != "..." {
 				selected++
+			} else if displayed[selected] == "..." {
+				// Do nothing
+			} else if viewStart+20 < len(orderedSubFiles) {
+				viewStart += 1
+			}
+			if selected > len(displayed)-1 {
+				selected = len(displayed) - 1
 			}
 		case keyboard.KeyArrowRight:
-			selectedItem := orderedSubFiles[selected]
-			if subDir, isDir := currentDir.Subdirectories[strings.TrimSuffix(selectedItem, string(os.PathSeparator))]; isDir {
+			selectedItem := displayed[selected]
+			if selectedItem == "..." {
+				// Do nothing
+			} else if subDir, isDir := currentDir.Subdirectories[strings.TrimSuffix(selectedItem, string(os.PathSeparator))]; isDir {
 				currentDir = subDir
 				prevSelected = selected
 				selected = 0
+				viewStart = 0
+				// Preload the new current directory's parent and siblings
+				preloadParentAndSiblings(currentDir)
 			}
 		case keyboard.KeyArrowLeft:
-			if currentDir.Parent != nil {
-				currentDir = currentDir.Parent
-				if len(currentDir.Subdirectories)+len(currentDir.Files) > prevSelected {
-					selected = prevSelected
+			parentPath := filepath.Dir(currentDir.FullPath)
+			if parentPath != currentDir.FullPath && parentPath != "." {
+				// Check if parent is already linked
+				if currentDir.Parent != nil {
+					// Parent exists, but check if it's cached and needs updating
+					cacheMutex.RLock()
+					_, exists := directoryCache[parentPath]
+					cacheMutex.RUnlock()
+					if !exists {
+						// Parent not cached, recalculate and cache it asynchronously
+						go func(parent *Directory, path string) {
+							if _, _, err := BuildDirectoryRecursion(parent); err == nil {
+								cacheMutex.Lock()
+								directoryCache[path] = parent
+								cacheMutex.Unlock()
+								cacheDirectoryTree(parent)
+							}
+						}(currentDir.Parent, parentPath)
+					}
+					currentDir = currentDir.Parent
+					if len(currentDir.Subdirectories)+len(currentDir.Files) > prevSelected {
+						selected = prevSelected
+					} else {
+						selected = 0
+					}
+					viewStart = 0
+					// Preload the new current directory's parent and siblings
+					preloadParentAndSiblings(currentDir)
 				} else {
-					selected = 0
-				}
-			} else {
-				// Navigate past root: build parent directory
-				parentPath := filepath.Dir(currentDir.FullPath)
-				if parentPath != currentDir.FullPath && parentPath != "." {
-					parentDir, err := ParseDirectory(parentPath, nil)
-					if err == nil {
-						parentDir.Subdirectories = make(map[string]*Directory)
-						parentDir.Files = make(map[string]*FileInfo)
-						// Populate subdirectories and files for the parent
-						_, _, err = BuildDirectoryRecursion(parentDir)
+					// No parent link yet, build and cache the parent
+					// Check if parent is cached first
+					cacheMutex.RLock()
+					cachedParent, exists := directoryCache[parentPath]
+					cacheMutex.RUnlock()
+					if exists {
+						currentDir = cachedParent
+						selected = 0
+						viewStart = 0
+					} else {
+						// Build parent directory fully for correct display
+						parentDir, err := ParseDirectory(parentPath, nil)
 						if err == nil {
-							// Set current dir as child of parent
-							parentDir.Subdirectories[currentDir.Name] = currentDir
-							currentDir.Parent = parentDir
-							currentDir = parentDir
-							selected = 0
+							// Synchronously populate parent with all immediate contents
+							if _, _, err := BuildDirectoryRecursion(parentDir); err == nil {
+								// Set current dir as child of parent
+								parentDir.Subdirectories[currentDir.Name] = currentDir
+								currentDir.Parent = parentDir
+								currentDir = parentDir
+								selected = 0
+								viewStart = 0
+
+								// Cache the populated parent asynchronously
+								go func() {
+									cacheMutex.Lock()
+									directoryCache[parentPath] = parentDir
+									cacheMutex.Unlock()
+									// Also cache all subdirectories
+									cacheDirectoryTree(parentDir)
+								}()
+								// Preload the new current directory's parent and siblings
+								preloadParentAndSiblings(currentDir)
+							}
 						}
 					}
 				}
@@ -293,10 +512,14 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 		case keyboard.KeyEnter:
 			selectedItem := orderedSubFiles[selected]
 			if subDir, isDir := currentDir.Subdirectories[strings.TrimSuffix(selectedItem, string(os.PathSeparator))]; isDir {
-				return subDir, nil, nil
+				if !subDir.Unreadable {
+					return subDir, nil, nil
+				}
 			}
 			if fileInfo, isFile := currentDir.Files[selectedItem]; isFile {
-				return nil, fileInfo, nil
+				if !fileInfo.Unreadable {
+					return nil, fileInfo, nil
+				}
 			}
 		case keyboard.KeyCtrlC:
 			fmt.Println("\nTerminating...")
@@ -308,8 +531,11 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 }
 
 func displayDirectoryDetails(Dir *Directory) string {
-
-	colorDirName := colors.SetColor(Dir.Name+string(os.PathSeparator), tc.ElectricBlue)
+	color := tc.ElectricBlue
+	if Dir.Unreadable {
+		color = tc.Gray
+	}
+	colorDirName := colors.SetColor(Dir.Name+string(os.PathSeparator), color)
 	colorSubObjectCount := colors.SetColor(fmt.Sprint(Dir.SubObjectCount), tc.Crimson)
 	colorDirOctal := colors.SetColor(Dir.Permissions, tc.Gold)
 	colorDirOwner := colors.SetColor(Dir.Owner, tc.VibrantPink)
@@ -323,7 +549,11 @@ func displayDirectoryDetails(Dir *Directory) string {
 }
 
 func displayFileDetails(fileInfo *FileInfo) string {
-	colorFileName := colors.SetColor(fileInfo.Name, tc.Mint)
+	color := tc.Mint
+	if fileInfo.Unreadable {
+		color = tc.Gray
+	}
+	colorFileName := colors.SetColor(fileInfo.Name, color)
 	colorFileOctal := colors.SetColor(fileInfo.Permissions, tc.Gold)
 	colorFileOwner := colors.SetColor(fileInfo.Owner, tc.VibrantPink)
 	colorFileGroup := colors.SetColor(fileInfo.Group, tc.Fuchsia)
@@ -342,6 +572,11 @@ func displaySortedDirectory(currentDir *Directory, options []string, selected in
 			fmt.Print(tc.Coral + "> ")
 		} else {
 			fmt.Print("  ")
+		}
+
+		if option == "..." {
+			fmt.Println("...")
+			continue
 		}
 
 		if subDir, isDir := currentDir.Subdirectories[strings.TrimSuffix(option, string(os.PathSeparator))]; isDir {

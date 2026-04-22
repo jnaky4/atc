@@ -4,9 +4,20 @@ import (
 	"filesystem/files"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		fmt.Println("\nReceived signal, exiting...")
+		os.Exit(0)
+	}()
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Println("Error:", err)
