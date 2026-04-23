@@ -24,6 +24,7 @@ import (
 	"github.com/chzyer/readline"
 	"github.com/eiannone/keyboard"
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 )
 
@@ -31,6 +32,89 @@ import (
 var directoryCache = make(map[string]*Directory)
 var cacheMutex sync.RWMutex
 var logLevel = "error"
+
+// Worker pool for concurrent directory processing
+const numWorkers = 32
+
+type WorkItem struct {
+	dir      *Directory
+	fsidDev  [2]int32 // filesystem ID to detect mount points
+	resultCh chan WorkResult
+}
+
+type WorkResult struct {
+	size  int64
+	count int64
+	err   error
+}
+
+var (
+	workerPool *WorkerPool
+	poolOnce   sync.Once
+)
+
+type WorkerPool struct {
+	workQueue chan WorkItem
+	wg        sync.WaitGroup
+}
+
+func init() {
+	// Initialize worker pool on package load
+	poolOnce.Do(func() {
+		workerPool = NewWorkerPool(numWorkers)
+	})
+}
+
+func NewWorkerPool(numWorkers int) *WorkerPool {
+	pool := &WorkerPool{
+		workQueue: make(chan WorkItem, numWorkers*2), // buffer for smooth dispatch
+	}
+
+	pool.wg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go pool.worker()
+	}
+
+	return pool
+}
+
+func (p *WorkerPool) worker() {
+	defer p.wg.Done()
+	for item := range p.workQueue {
+		result := p.processDirectory(item.dir, item.fsidDev)
+		item.resultCh <- result
+	}
+}
+
+func (p *WorkerPool) processDirectory(dir *Directory, fsidDev [2]int32) WorkResult {
+	size, count, err := buildDirectoryRecursionInternal(dir, fsidDev)
+	return WorkResult{size: size, count: count, err: err}
+}
+
+func (p *WorkerPool) Submit(dir *Directory, fsidDev [2]int32) chan WorkResult {
+	resultCh := make(chan WorkResult, 1)
+	p.workQueue <- WorkItem{dir: dir, fsidDev: fsidDev, resultCh: resultCh}
+	return resultCh
+}
+
+func (p *WorkerPool) Shutdown() {
+	close(p.workQueue)
+	p.wg.Wait()
+}
+
+func getTerminalWidth() int {
+	width, _, err := term.GetSize(0)
+	if err != nil {
+		return 80 // default
+	}
+	if width > 132 {
+		return 132
+	}
+	if width < 80 {
+		return 80
+	}
+	return width
+}
 
 func ParseFile(fullPath string, parent *Directory) (*FileInfo, error) {
 	fi, err := os.Stat(fullPath)
@@ -96,6 +180,7 @@ func BuildDirectoryStructure(dirPath string) (*Directory, error) {
 	return startDir, nil
 }
 
+// BuildDirectoryRecursion builds directory structure recursively using worker pool for parallelization
 func BuildDirectoryRecursion(dir *Directory) (int64, int64, error) {
 	var currentStat unix.Statfs_t
 	err := unix.Statfs(dir.FullPath, &currentStat)
@@ -104,9 +189,13 @@ func BuildDirectoryRecursion(dir *Directory) (int64, int64, error) {
 	}
 	dev := currentStat.Fsid.Val
 
+	return buildDirectoryRecursiveWithPool(dir, dev)
+}
+
+// buildDirectoryRecursiveWithPool processes directory immediately, queues subdirectories asynchronously
+func buildDirectoryRecursiveWithPool(dir *Directory, fsidDev [2]int32) (int64, int64, error) {
 	dirEntries, err := os.ReadDir(dir.FullPath)
 	if err != nil {
-		// Mark as unreadable instead of returning error
 		dir.Unreadable = true
 		if logLevel == "warn" {
 			fmt.Printf("Failed to read directory: %s, error: %v\n", dir.FullPath, err)
@@ -117,21 +206,21 @@ func BuildDirectoryRecursion(dir *Directory) (int64, int64, error) {
 	var totalSize int64
 	var totalCount int64
 
+	// First pass: populate immediate children without waiting
 	for _, entry := range dirEntries {
 		totalCount++
 		fullPath := filepath.Clean(filepath.Join(dir.FullPath, entry.Name()))
 		fi, err := entry.Info()
 
 		if err != nil {
-			return 0, 0, fmt.Errorf("failed to get info for %s: %w", fullPath, err)
+			continue
 		}
 
-		//if symlink, treat as file with 0 size
+		// Handle symlinks
 		if fi.Mode()&os.ModeSymlink != 0 {
-			//todo not windows compatible
 			target, err := os.Readlink(fullPath)
 			if err != nil {
-				return 0, 0, fmt.Errorf("failed to read symlink %s: %w", fullPath, err)
+				continue
 			}
 			dir.Files[entry.Name()] = &FileInfo{
 				Name:        fi.Name(),
@@ -146,10 +235,10 @@ func BuildDirectoryRecursion(dir *Directory) (int64, int64, error) {
 			continue
 		}
 
+		// Handle directories - parse but don't recurse
 		if fi.IsDir() {
 			subDir, err := ParseDirectory(fullPath, dir)
 			if err != nil {
-				// Create unreadable dir
 				subDir = &Directory{
 					FileInfo: FileInfo{
 						Name:        fi.Name(),
@@ -171,22 +260,24 @@ func BuildDirectoryRecursion(dir *Directory) (int64, int64, error) {
 			if err != nil {
 				subDir.Unreadable = true
 				subDir.Size = 0
-			} else if subStat.Fsid.Val[0] != dev[0] || subStat.Fsid.Val[1] != dev[1] {
-				// Mount point, don't recurse, size 0
+			} else if subStat.Fsid.Val[0] != fsidDev[0] || subStat.Fsid.Val[1] != fsidDev[1] {
+				// Mount point, don't recurse
 				subDir.Size = 0
 			} else {
-				subDirSize, subDirCount, _ := BuildDirectoryRecursion(subDir)
-				totalSize += subDirSize
-				totalCount += subDirCount
+				// Queue subdirectory for async processing - DON'T WAIT
+				go func(subDir *Directory) {
+					resultCh := workerPool.Submit(subDir, fsidDev)
+					<-resultCh // Consume result but don't block
+				}(subDir)
 			}
 
 			dir.Subdirectories[entry.Name()] = subDir
 			continue
 		}
 
+		// Handle files
 		pfile, err := ParseFile(fullPath, dir)
 		if err != nil {
-			// Create unreadable file info
 			pfile = &FileInfo{
 				Name:        fi.Name(),
 				Permissions: "",
@@ -204,6 +295,7 @@ func BuildDirectoryRecursion(dir *Directory) (int64, int64, error) {
 		}
 	}
 
+	// Calculate directory info immediately (no subdirectory recursion)
 	dirInfo, err := os.Stat(dir.FullPath)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to stat directory %s: %w", dir.FullPath, err)
@@ -211,6 +303,11 @@ func BuildDirectoryRecursion(dir *Directory) (int64, int64, error) {
 	dir.Size = totalSize + dirInfo.Size()
 	dir.SubObjectCount = totalCount
 	return totalSize, totalCount, nil
+}
+
+// buildDirectoryRecursionInternal is called by worker pool - processes directory fully recursively
+func buildDirectoryRecursionInternal(dir *Directory, fsidDev [2]int32) (int64, int64, error) {
+	return buildDirectoryRecursiveWithPool(dir, fsidDev)
 }
 
 // cacheDirectoryTree recursively caches a directory and all its subdirectories
@@ -244,7 +341,7 @@ func preloadParentAndSiblings(currentDir *Directory) {
 			return
 		}
 
-		// Build full parent directory structure
+		// Build full parent directory structure with batching
 		if _, _, err := BuildDirectoryRecursion(parentDir); err != nil {
 			return
 		}
@@ -261,25 +358,23 @@ func preloadParentAndSiblings(currentDir *Directory) {
 		cacheMutex.Unlock()
 		cacheDirectoryTree(parentDir)
 
-		// Now preload the parent's parent and siblings
+		// Preload grandparent level in batches
 		grandParentPath := filepath.Dir(parentPath)
 		if grandParentPath != parentPath && grandParentPath != "." {
-			go func() {
-				cacheMutex.RLock()
-				_, exists := directoryCache[grandParentPath]
-				cacheMutex.RUnlock()
-				if !exists {
-					grandParent, err := ParseDirectory(grandParentPath, nil)
-					if err == nil {
-						if _, _, err := BuildDirectoryRecursion(grandParent); err == nil {
-							cacheMutex.Lock()
-							directoryCache[grandParentPath] = grandParent
-							cacheMutex.Unlock()
-							cacheDirectoryTree(grandParent)
-						}
+			cacheMutex.RLock()
+			_, exists := directoryCache[grandParentPath]
+			cacheMutex.RUnlock()
+			if !exists {
+				grandParent, err := ParseDirectory(grandParentPath, nil)
+				if err == nil {
+					if _, _, err := BuildDirectoryRecursion(grandParent); err == nil {
+						cacheMutex.Lock()
+						directoryCache[grandParentPath] = grandParent
+						cacheMutex.Unlock()
+						cacheDirectoryTree(grandParent)
 					}
 				}
-			}()
+			}
 		}
 	}()
 }
@@ -365,6 +460,7 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 	viewStart := 0
 
 	for {
+		width := getTerminalWidth()
 		fmt.Print(tc.ClearScreen)
 
 		if viewStart > 0 {
@@ -378,7 +474,7 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 		}
 
 		// Display current directory details
-		print(displayDirectoryDetails(currentDir))
+		print(displayDirectoryDetails(currentDir, width))
 
 		// Retrieve ordered items for current directory
 		orderedSubFiles := getOrderedDirectoryItems(currentDir)
@@ -396,7 +492,7 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 		}
 
 		// Display files and subdirectories with selection indicator
-		displaySortedDirectory(currentDir, displayed, selected)
+		displaySortedDirectory(currentDir, displayed, selected, width)
 
 		// Preload parent and siblings in background for smooth navigation
 		preloadParentAndSiblings(currentDir)
@@ -530,12 +626,19 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 	}
 }
 
-func displayDirectoryDetails(Dir *Directory) string {
+func displayDirectoryDetails(Dir *Directory, width int) string {
 	color := tc.ElectricBlue
 	if Dir.Unreadable {
 		color = tc.Gray
 	}
-	colorDirName := colors.SetColor(Dir.Name+string(os.PathSeparator), color)
+	plainName := Dir.Name + string(os.PathSeparator)
+	maxNameLen := width - 50 // estimate for other fields
+	if len(plainName) > maxNameLen && maxNameLen > 3 {
+		plainName = plainName[:maxNameLen-3] + "..."
+	} else if len(plainName) > maxNameLen {
+		plainName = "..."
+	}
+	colorDirName := colors.SetColor(plainName, color)
 	colorSubObjectCount := colors.SetColor(fmt.Sprint(Dir.SubObjectCount), tc.Crimson)
 	colorDirOctal := colors.SetColor(Dir.Permissions, tc.Gold)
 	colorDirOwner := colors.SetColor(Dir.Owner, tc.VibrantPink)
@@ -548,12 +651,19 @@ func displayDirectoryDetails(Dir *Directory) string {
 	return fmt.Sprintf("%s %s %s %s:%s %s%s\n", colorDirName, colorSubObjectCount, colorDirOctal, colorDirOwner, colorDirGroup, colorDirSize, colorTarget)
 }
 
-func displayFileDetails(fileInfo *FileInfo) string {
+func displayFileDetails(fileInfo *FileInfo, width int) string {
 	color := tc.Mint
 	if fileInfo.Unreadable {
 		color = tc.Gray
 	}
-	colorFileName := colors.SetColor(fileInfo.Name, color)
+	plainName := fileInfo.Name
+	maxNameLen := width - 40 // estimate for other fields, less than dir since no subcount
+	if len(plainName) > maxNameLen && maxNameLen > 3 {
+		plainName = plainName[:maxNameLen-3] + "..."
+	} else if len(plainName) > maxNameLen {
+		plainName = "..."
+	}
+	colorFileName := colors.SetColor(plainName, color)
 	colorFileOctal := colors.SetColor(fileInfo.Permissions, tc.Gold)
 	colorFileOwner := colors.SetColor(fileInfo.Owner, tc.VibrantPink)
 	colorFileGroup := colors.SetColor(fileInfo.Group, tc.Fuchsia)
@@ -566,7 +676,7 @@ func displayFileDetails(fileInfo *FileInfo) string {
 	return fmt.Sprintf("%s %s %s:%s %s%s\n", colorFileName, colorFileOctal, colorFileOwner, colorFileGroup, colorFileSize, colorTarget)
 }
 
-func displaySortedDirectory(currentDir *Directory, options []string, selected int) {
+func displaySortedDirectory(currentDir *Directory, options []string, selected int, width int) {
 	for i, option := range options {
 		if i == selected {
 			fmt.Print(tc.Coral + "> ")
@@ -580,15 +690,15 @@ func displaySortedDirectory(currentDir *Directory, options []string, selected in
 		}
 
 		if subDir, isDir := currentDir.Subdirectories[strings.TrimSuffix(option, string(os.PathSeparator))]; isDir {
-			print(displayDirectoryDetails(subDir))
+			print(displayDirectoryDetails(subDir, width))
 		} else if fileInfo, isFile := currentDir.Files[option]; isFile {
-			print(displayFileDetails(fileInfo))
+			print(displayFileDetails(fileInfo, width))
 		}
 	}
 }
 
 func DirectorySelect(selectedDir *Directory) string {
-	option, err := selection.SelectOption(displayDirectoryDetails(selectedDir), GetDirectoryOptions())
+	option, err := selection.SelectOption(displayDirectoryDetails(selectedDir, 80), GetDirectoryOptions())
 	if err != nil {
 		println(err.Error())
 		return ""
@@ -597,7 +707,7 @@ func DirectorySelect(selectedDir *Directory) string {
 }
 
 func FileSelect(selectedFile *FileInfo) string {
-	option, err := selection.SelectOption(displayFileDetails(selectedFile), GetDirectoryOptions())
+	option, err := selection.SelectOption(displayFileDetails(selectedFile, 80), GetDirectoryOptions())
 	if err != nil {
 		println(err.Error())
 		return ""
@@ -926,7 +1036,7 @@ func HandleDirOperation(operation string, dir *Directory) {
 			println(err.Error())
 		}
 	case string(Delete):
-		err := Deletion(&dir.FileInfo, displayDirectoryDetails(dir), true)
+		err := Deletion(&dir.FileInfo, displayDirectoryDetails(dir, 80), true)
 		if err != nil {
 			println(err.Error())
 		}
@@ -968,7 +1078,7 @@ func HandleFileOperation(operation string, selectedFile *FileInfo) {
 		}
 		updateFileSystem(selectedFile, selectedFile.FullPath+".zip")
 	case string(Delete):
-		err := Deletion(selectedFile, displayFileDetails(selectedFile), false)
+		err := Deletion(selectedFile, displayFileDetails(selectedFile, 80), false)
 		if err != nil {
 			println(err.Error())
 		}
