@@ -2,6 +2,7 @@ package files
 
 import (
 	"bufio"
+	"bytes"
 	"filesystem/cli/colors"
 	selection "filesystem/cli/select"
 	"filesystem/const/regexStr"
@@ -51,6 +52,25 @@ var numWorkers = runtime.NumCPU() * 2
 // Released by each goroutine before it spawns its children, so there is no deadlock.
 var scanSem = make(chan struct{}, numWorkers)
 
+// screenBufPool reuses *bytes.Buffer instances across screen redraws.
+// A single pooled buffer assembles the entire frame before writing,
+// replacing O(n) per-item allocations and write syscalls with one each.
+var screenBufPool = sync.Pool{
+	New: func() any {
+		return bytes.NewBuffer(make([]byte, 0, 16384))
+	},
+}
+
+// dirSlicePool reuses the needsScan []*Directory slice inside scanDirectory.
+// With thousands of directories scanned during startup, this eliminates
+// thousands of small slice allocations that would pressure the GC.
+var dirSlicePool = sync.Pool{
+	New: func() any {
+		s := make([]*Directory, 0, 32)
+		return &s
+	},
+}
+
 // scanDirectory scans exactly one directory level: populates dir.Files,
 // dir.Subdirectories, and dir.SubObjectCount, then spawns bounded goroutines
 // for each subdirectory that lives on the same filesystem.
@@ -71,7 +91,12 @@ func scanDirectory(dir *Directory, fsidDev [2]int32) {
 		return
 	}
 
-	var needsScan []*Directory
+	needsScanPtr := dirSlicePool.Get().(*[]*Directory)
+	needsScan := (*needsScanPtr)[:0]
+	defer func() {
+		*needsScanPtr = needsScan[:0]
+		dirSlicePool.Put(needsScanPtr)
+	}()
 
 	for _, entry := range entries {
 		fullPath := filepath.Clean(filepath.Join(dir.FullPath, entry.Name()))
@@ -548,28 +573,36 @@ func AutoSize(sizeInBytes int64) string {
 	}
 }
 
-func getOrderedDirectoryItems(dir *Directory) []string {
-	var visibleItems []string
-	var hiddenItems []string
+func getOrderedDirectoryItems(dir *Directory, out []string) []string {
+	out = out[:0]
 	dir.mu.RLock()
+	// Visible items first (no leading dot)
+	for name := range dir.Subdirectories {
+		if !strings.HasPrefix(name, ".") {
+			out = append(out, name+"/")
+		}
+	}
+	for name := range dir.Files {
+		if !strings.HasPrefix(name, ".") {
+			out = append(out, name)
+		}
+	}
+	pivot := len(out) // end of visible, start of hidden
+	// Hidden items second
 	for name := range dir.Subdirectories {
 		if strings.HasPrefix(name, ".") {
-			hiddenItems = append(hiddenItems, name+"/")
-		} else {
-			visibleItems = append(visibleItems, name+"/")
+			out = append(out, name+"/")
 		}
 	}
 	for name := range dir.Files {
 		if strings.HasPrefix(name, ".") {
-			hiddenItems = append(hiddenItems, name)
-		} else {
-			visibleItems = append(visibleItems, name)
+			out = append(out, name)
 		}
 	}
 	dir.mu.RUnlock()
-	sort.Strings(visibleItems)
-	sort.Strings(hiddenItems)
-	return append(visibleItems, hiddenItems...)
+	sort.Strings(out[:pivot])
+	sort.Strings(out[pivot:])
+	return out
 }
 
 func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, error) {
@@ -600,23 +633,22 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 	for {
 		if needsRedraw {
 			width := getTerminalWidth()
-			fmt.Print(tc.ClearScreen)
+			buf := screenBufPool.Get().(*bytes.Buffer)
+			buf.Reset()
 
+			buf.WriteString(string(tc.ClearScreen))
 			if viewStart > 0 {
-				fmt.Println("...")
+				buf.WriteString("...\n")
 			}
 
-			// Display the parent directory path
 			parentPath := filepath.Dir(currentDir.FullPath)
 			if parentPath != currentDir.FullPath && parentPath != "." {
-				fmt.Println(parentPath + "/")
+				buf.WriteString(parentPath + "/\n")
 			}
 
-			// Display current directory details
-			print(displayDirectoryDetails(currentDir, width))
+			writeDirectoryDetails(buf, currentDir, width)
 
-			// Rebuild the ordered item list and the current viewport slice.
-			orderedSubFiles = getOrderedDirectoryItems(currentDir)
+			orderedSubFiles = getOrderedDirectoryItems(currentDir, orderedSubFiles)
 			displayed = displayed[:0]
 			if viewStart > 0 {
 				displayed = append(displayed, "...")
@@ -630,16 +662,16 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 				displayed = append(displayed, "...")
 			}
 
-			// Clamp selection so it is never out of bounds after a redraw.
 			if len(displayed) > 0 && selected >= len(displayed) {
 				selected = len(displayed) - 1
 			}
 
-			// Display files and subdirectories with selection indicator
-			displaySortedDirectory(currentDir, displayed, selected, width)
+			writeSortedDirectory(buf, currentDir, displayed, selected, width)
 
-			// Preload parent and siblings in background for smooth navigation
 			preloadParentAndSiblings(currentDir)
+
+			os.Stdout.Write(buf.Bytes())
+			screenBufPool.Put(buf)
 
 			needsRedraw = false
 		}
@@ -789,89 +821,117 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 	}
 }
 
-func displayDirectoryDetails(Dir *Directory, width int) string {
+// writeDirectoryDetails writes Dir's formatted details line into buf.
+// Used by the hot-path draw loop to avoid allocating a string per item.
+func writeDirectoryDetails(buf *bytes.Buffer, Dir *Directory, width int) {
 	color := tc.ElectricBlue
 	if Dir.Unreadable {
 		color = tc.Gray
 	}
 	plainName := Dir.Name + string(os.PathSeparator)
-	maxNameLen := width - 50 // estimate for other fields
+	maxNameLen := width - 50
 	if len(plainName) > maxNameLen && maxNameLen > 3 {
 		plainName = plainName[:maxNameLen-3] + "..."
 	} else if len(plainName) > maxNameLen {
 		plainName = "..."
 	}
-	colorDirName := colors.SetColor(plainName, color)
 
-	// Read Size and SubObjectCount under lock
 	Dir.mu.RLock()
 	subCount := Dir.SubObjectCount
 	dirSize := Dir.Size
 	Dir.mu.RUnlock()
 
-	colorSubObjectCount := colors.SetColor(fmt.Sprint(subCount), tc.Crimson)
-	colorDirOctal := colors.SetColor(Dir.Permissions, tc.Gold)
-	colorDirOwner := colors.SetColor(Dir.Owner, tc.VibrantPink)
-	colorDirGroup := colors.SetColor(Dir.Group, tc.Fuchsia)
-	colorDirSize := colors.SetColor(AutoSize(dirSize), tc.SeaGreen)
-	colorTarget := ""
+	fmt.Fprintf(buf, "%s %s %s %s:%s %s",
+		colors.SetColor(plainName, color),
+		colors.SetColor(fmt.Sprint(subCount), tc.Crimson),
+		colors.SetColor(Dir.Permissions, tc.Gold),
+		colors.SetColor(Dir.Owner, tc.VibrantPink),
+		colors.SetColor(Dir.Group, tc.Fuchsia),
+		colors.SetColor(AutoSize(dirSize), tc.SeaGreen),
+	)
 	if Dir.Target != "" {
-		colorTarget = colors.SetColor(fmt.Sprintf(" -> %s", Dir.Target), tc.Orange)
+		fmt.Fprintf(buf, " -> %s", colors.SetColor(Dir.Target, tc.Orange))
 	}
-	return fmt.Sprintf("%s %s %s %s:%s %s%s\n", colorDirName, colorSubObjectCount, colorDirOctal, colorDirOwner, colorDirGroup, colorDirSize, colorTarget)
+	buf.WriteByte('\n')
 }
 
-func displayFileDetails(fileInfo *FileInfo, width int) string {
+// writeFileDetails writes fileInfo's formatted details line into buf.
+func writeFileDetails(buf *bytes.Buffer, fileInfo *FileInfo, width int) {
 	color := tc.Mint
 	if fileInfo.Unreadable {
 		color = tc.Gray
 	}
 	plainName := fileInfo.Name
-	maxNameLen := width - 40 // estimate for other fields, less than dir since no subcount
+	maxNameLen := width - 40
 	if len(plainName) > maxNameLen && maxNameLen > 3 {
 		plainName = plainName[:maxNameLen-3] + "..."
 	} else if len(plainName) > maxNameLen {
 		plainName = "..."
 	}
-	colorFileName := colors.SetColor(plainName, color)
-	colorFileOctal := colors.SetColor(fileInfo.Permissions, tc.Gold)
-	colorFileOwner := colors.SetColor(fileInfo.Owner, tc.VibrantPink)
-	colorFileGroup := colors.SetColor(fileInfo.Group, tc.Fuchsia)
-	colorFileSize := colors.SetColor(AutoSize(fileInfo.Size), tc.SeaGreen)
-	colorTarget := ""
-	if fileInfo.Target != "" {
-		colorTarget = colors.SetColor(fmt.Sprintf(" -> %s", fileInfo.Target), tc.Orange)
-	}
 
-	return fmt.Sprintf("%s %s %s:%s %s%s\n", colorFileName, colorFileOctal, colorFileOwner, colorFileGroup, colorFileSize, colorTarget)
+	fmt.Fprintf(buf, "%s %s %s:%s %s",
+		colors.SetColor(plainName, color),
+		colors.SetColor(fileInfo.Permissions, tc.Gold),
+		colors.SetColor(fileInfo.Owner, tc.VibrantPink),
+		colors.SetColor(fileInfo.Group, tc.Fuchsia),
+		colors.SetColor(AutoSize(fileInfo.Size), tc.SeaGreen),
+	)
+	if fileInfo.Target != "" {
+		fmt.Fprintf(buf, " -> %s", colors.SetColor(fileInfo.Target, tc.Orange))
+	}
+	buf.WriteByte('\n')
 }
 
-func displaySortedDirectory(currentDir *Directory, options []string, selected int, width int) {
-	// Hold RLock for the duration of the loop so that background scanDirectory
-	// goroutines cannot write to the maps while we are reading from them.
-	// displayDirectoryDetails acquires its own RLock on the child directory,
-	// which is a different mutex instance — no deadlock is possible.
+func displayDirectoryDetails(Dir *Directory, width int) string {
+	buf := screenBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	writeDirectoryDetails(buf, Dir, width)
+	s := buf.String()
+	screenBufPool.Put(buf)
+	return s
+}
+
+func displayFileDetails(fileInfo *FileInfo, width int) string {
+	buf := screenBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	writeFileDetails(buf, fileInfo, width)
+	s := buf.String()
+	screenBufPool.Put(buf)
+	return s
+}
+
+// writeSortedDirectory writes the visible directory listing into buf.
+// currentDir.mu.RLock is held for the duration to prevent concurrent map writes.
+func writeSortedDirectory(buf *bytes.Buffer, currentDir *Directory, options []string, selected int, width int) {
 	currentDir.mu.RLock()
 	defer currentDir.mu.RUnlock()
 
 	for i, option := range options {
 		if i == selected {
-			fmt.Print(tc.Coral + "> ")
+			buf.WriteString(string(tc.Coral) + "> ")
 		} else {
-			fmt.Print("  ")
+			buf.WriteString("  ")
 		}
 
 		if option == "..." {
-			fmt.Println("...")
+			buf.WriteString("...\n")
 			continue
 		}
 
 		if subDir, isDir := currentDir.Subdirectories[strings.TrimSuffix(option, string(os.PathSeparator))]; isDir {
-			print(displayDirectoryDetails(subDir, width))
+			writeDirectoryDetails(buf, subDir, width)
 		} else if fileInfo, isFile := currentDir.Files[option]; isFile {
-			print(displayFileDetails(fileInfo, width))
+			writeFileDetails(buf, fileInfo, width)
 		}
 	}
+}
+
+func displaySortedDirectory(currentDir *Directory, options []string, selected int, width int) {
+	buf := screenBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	writeSortedDirectory(buf, currentDir, options, selected, width)
+	os.Stdout.Write(buf.Bytes())
+	screenBufPool.Put(buf)
 }
 
 func DirectorySelect(selectedDir *Directory) string {
