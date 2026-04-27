@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/chzyer/readline"
 	"github.com/eiannone/keyboard"
@@ -34,7 +35,17 @@ var directoryCache = make(map[string]*Directory)
 var cacheMutex sync.RWMutex
 var logLevel = "error"
 
-const numWorkers = 32
+// displayDirty is set to 1 by finalizeDirectory whenever a directory size is
+// written.  The display loop checks this flag on a 250 ms ticker and redraws
+// only when something has changed, capping background-driven repaints at 4 per
+// second so the screen stays readable while a large tree is scanning.
+var displayDirty int32
+
+// numWorkers is set at startup to twice the number of logical CPU threads.
+// Doubling saturates the semaphore queue so workers are always ready to pick
+// up the next directory the moment a slot is released, minimising idle time
+// on I/O-bound scans where goroutines spend most of their time waiting on disk.
+var numWorkers = runtime.NumCPU() * 2
 
 // scanSem bounds the number of concurrent directory-scan goroutines.
 // Released by each goroutine before it spawns its children, so there is no deadlock.
@@ -192,6 +203,11 @@ func finalizeDirectory(dir *Directory) {
 
 	atomic.StoreInt32(&dir.scanComplete, 1)
 
+	// Mark the display as dirty so the ticker-driven redraw picks it up.
+	// A simple store is sufficient; losing a concurrent store from another
+	// goroutine is harmless because the flag stays 1 either way.
+	atomic.StoreInt32(&displayDirty, 1)
+
 	// Notify parent under dir's lock so that preloadParentAndSiblings can
 	// atomically set Parent and read scanComplete without missing an update.
 	dir.mu.Lock()
@@ -270,6 +286,8 @@ func ParseDirectory(path string, parent *Directory) (*Directory, error) {
 // loop will show correct values on the next redraw after each subtree finishes.
 func BuildDirectoryStructure(dirPath string) (*Directory, error) {
 	defer t.Timer()()
+
+	fmt.Printf("scan pool: %d workers (%d logical CPUs × 2)\n", numWorkers, runtime.NumCPU())
 
 	startDir, err := ParseDirectory(dirPath, nil)
 	if err != nil {
@@ -533,6 +551,7 @@ func AutoSize(sizeInBytes int64) string {
 func getOrderedDirectoryItems(dir *Directory) []string {
 	var visibleItems []string
 	var hiddenItems []string
+	dir.mu.RLock()
 	for name := range dir.Subdirectories {
 		if strings.HasPrefix(name, ".") {
 			hiddenItems = append(hiddenItems, name+"/")
@@ -547,64 +566,104 @@ func getOrderedDirectoryItems(dir *Directory) []string {
 			visibleItems = append(visibleItems, name)
 		}
 	}
+	dir.mu.RUnlock()
 	sort.Strings(visibleItems)
 	sort.Strings(hiddenItems)
 	return append(visibleItems, hiddenItems...)
 }
 
 func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, error) {
-	if err := keyboard.Open(); err != nil {
+	// GetKeys opens the keyboard and returns an event channel so we can also
+	// select on the refresh ticker without blocking on a keypress.
+	keyCh, err := keyboard.GetKeys(10)
+	if err != nil {
 		return nil, nil, err
 	}
 	defer keyboard.Close()
+
+	// Ticker drives background size updates.  250 ms caps repaints at 4 per
+	// second while a tree is scanning — smooth and readable, never disruptive.
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
 
 	currentDir := startDir
 	selected := 0
 	prevSelected := 0
 	viewStart := 0
+	needsRedraw := true
+
+	// orderedSubFiles and displayed are declared at loop scope so both the
+	// draw path and all key handlers can reference the same snapshot.
+	var orderedSubFiles []string
+	var displayed []string
 
 	for {
-		width := getTerminalWidth()
-		fmt.Print(tc.ClearScreen)
+		if needsRedraw {
+			width := getTerminalWidth()
+			fmt.Print(tc.ClearScreen)
 
-		if viewStart > 0 {
-			fmt.Println("...")
+			if viewStart > 0 {
+				fmt.Println("...")
+			}
+
+			// Display the parent directory path
+			parentPath := filepath.Dir(currentDir.FullPath)
+			if parentPath != currentDir.FullPath && parentPath != "." {
+				fmt.Println(parentPath + "/")
+			}
+
+			// Display current directory details
+			print(displayDirectoryDetails(currentDir, width))
+
+			// Rebuild the ordered item list and the current viewport slice.
+			orderedSubFiles = getOrderedDirectoryItems(currentDir)
+			displayed = displayed[:0]
+			if viewStart > 0 {
+				displayed = append(displayed, "...")
+			}
+			start := viewStart
+			end := min(viewStart+20, len(orderedSubFiles))
+			for i := start; i < end; i++ {
+				displayed = append(displayed, orderedSubFiles[i])
+			}
+			if end < len(orderedSubFiles) {
+				displayed = append(displayed, "...")
+			}
+
+			// Clamp selection so it is never out of bounds after a redraw.
+			if len(displayed) > 0 && selected >= len(displayed) {
+				selected = len(displayed) - 1
+			}
+
+			// Display files and subdirectories with selection indicator
+			displaySortedDirectory(currentDir, displayed, selected, width)
+
+			// Preload parent and siblings in background for smooth navigation
+			preloadParentAndSiblings(currentDir)
+
+			needsRedraw = false
 		}
 
-		// Display the parent directory path
-		parentPath := filepath.Dir(currentDir.FullPath)
-		if parentPath != currentDir.FullPath && parentPath != "." {
-			fmt.Println(parentPath + "/")
-		}
-
-		// Display current directory details
-		print(displayDirectoryDetails(currentDir, width))
-
-		// Retrieve ordered items for current directory
-		orderedSubFiles := getOrderedDirectoryItems(currentDir)
-		var displayed []string
-		if viewStart > 0 {
-			displayed = append(displayed, "...")
-		}
-		start := viewStart
-		end := min(viewStart+20, len(orderedSubFiles))
-		for i := start; i < end; i++ {
-			displayed = append(displayed, orderedSubFiles[i])
-		}
-		if end < len(orderedSubFiles) {
-			displayed = append(displayed, "...")
-		}
-
-		// Display files and subdirectories with selection indicator
-		displaySortedDirectory(currentDir, displayed, selected, width)
-
-		// Preload parent and siblings in background for smooth navigation
-		preloadParentAndSiblings(currentDir)
-
-		// Capture keyboard input for navigation
-		_, key, err := keyboard.GetKey()
-		if err != nil {
-			return nil, nil, err
+		// Wait for a keypress or a ticker-driven background refresh.
+		var key keyboard.Key
+		select {
+		case event, ok := <-keyCh:
+			if !ok {
+				return nil, nil, fmt.Errorf("keyboard channel closed unexpectedly")
+			}
+			if event.Err != nil {
+				return nil, nil, event.Err
+			}
+			key = event.Key
+			needsRedraw = true
+		case <-ticker.C:
+			// Only repaint if finalizeDirectory has written new sizes since the
+			// last draw.  CompareAndSwap atomically clears the flag so we do not
+			// redraw again until the next batch of completions arrives.
+			if atomic.CompareAndSwapInt32(&displayDirty, 1, 0) {
+				needsRedraw = true
+			}
+			continue
 		}
 
 		switch key {
@@ -788,6 +847,13 @@ func displayFileDetails(fileInfo *FileInfo, width int) string {
 }
 
 func displaySortedDirectory(currentDir *Directory, options []string, selected int, width int) {
+	// Hold RLock for the duration of the loop so that background scanDirectory
+	// goroutines cannot write to the maps while we are reading from them.
+	// displayDirectoryDetails acquires its own RLock on the child directory,
+	// which is a different mutex instance — no deadlock is possible.
+	currentDir.mu.RLock()
+	defer currentDir.mu.RUnlock()
+
 	for i, option := range options {
 		if i == selected {
 			fmt.Print(tc.Coral + "> ")
