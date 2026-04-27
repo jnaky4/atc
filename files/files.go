@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+
 	"os/user"
 	"path/filepath"
 	"regexp"
@@ -34,7 +35,7 @@ import (
 // directoryCache stores already-calculated directory structures to avoid recalculation
 var directoryCache = make(map[string]*Directory)
 var cacheMutex sync.RWMutex
-var logLevel = "error"
+var logLevel string
 
 // displayDirty is set to 1 by finalizeDirectory whenever a directory size is
 // written.  The display loop checks this flag on a 250 ms ticker and redraws
@@ -42,15 +43,19 @@ var logLevel = "error"
 // second so the screen stays readable while a large tree is scanning.
 var displayDirty int32
 
-// numWorkers is set at startup to twice the number of logical CPU threads.
-// Doubling saturates the semaphore queue so workers are always ready to pick
-// up the next directory the moment a slot is released, minimising idle time
-// on I/O-bound scans where goroutines spend most of their time waiting on disk.
-var numWorkers = runtime.NumCPU() * 2
+// numWorkers and scanSem are set by init() after Cfg is loaded so the pool
+// size can be driven by config (workers=0 means auto: runtime.NumCPU()*2).
+var numWorkers int
+var scanSem chan struct{}
 
-// scanSem bounds the number of concurrent directory-scan goroutines.
-// Released by each goroutine before it spawns its children, so there is no deadlock.
-var scanSem = make(chan struct{}, numWorkers)
+func init() {
+	Cfg = loadOrCreateConfig()
+
+	logLevel = Cfg.Logging.Level
+
+	numWorkers = runtime.NumCPU() * 2
+	scanSem = make(chan struct{}, numWorkers)
+}
 
 // screenBufPool reuses *bytes.Buffer instances across screen redraws.
 // A single pooled buffer assembles the entire frame before writing,
@@ -248,16 +253,35 @@ func finalizeDirectory(dir *Directory) {
 
 func getTerminalWidth() int {
 	width, _, err := term.GetSize(0)
-	if err != nil {
-		return 80 // default
-	}
-	if width > 132 {
-		return 132
-	}
-	if width < 80 {
-		return 80
+	if err != nil || width < 20 {
+		return 80 // safe fallback
 	}
 	return width
+}
+
+// getTerminalPageSize returns the number of directory entries that fit in the
+// current terminal window.  It reads the live terminal height on every call so
+// the listing automatically expands or contracts when the user resizes the
+// window — no signal handler required.
+//
+// Fixed overhead per frame:
+//   - 1 line  parent directory path
+//   - 1 line  current directory details
+//   - 2 lines top / bottom "..." scroll indicators (worst case both present)
+//
+// Cfg.Display.PageSize acts as a floor: the listing never shrinks below the
+// configured minimum regardless of how small the terminal becomes.
+func getTerminalPageSize() int {
+	const overhead = 4
+	_, height, err := term.GetSize(0)
+	if err != nil || height <= overhead {
+		return Cfg.Display.PageSize
+	}
+	available := height - overhead
+	if available < Cfg.Display.PageSize {
+		return Cfg.Display.PageSize
+	}
+	return available
 }
 
 func ParseFile(fullPath string, parent *Directory) (*FileInfo, error) {
@@ -588,15 +612,18 @@ func getOrderedDirectoryItems(dir *Directory, out []string) []string {
 		}
 	}
 	pivot := len(out) // end of visible, start of hidden
-	// Hidden items second
-	for name := range dir.Subdirectories {
-		if strings.HasPrefix(name, ".") {
-			out = append(out, name+"/")
+
+	// Hidden items are only appended when show_hidden is enabled in config.
+	if Cfg.Display.ShowHidden {
+		for name := range dir.Subdirectories {
+			if strings.HasPrefix(name, ".") {
+				out = append(out, name+"/")
+			}
 		}
-	}
-	for name := range dir.Files {
-		if strings.HasPrefix(name, ".") {
-			out = append(out, name)
+		for name := range dir.Files {
+			if strings.HasPrefix(name, ".") {
+				out = append(out, name)
+			}
 		}
 	}
 	dir.mu.RUnlock()
@@ -616,7 +643,7 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 
 	// Ticker drives background size updates.  250 ms caps repaints at 4 per
 	// second while a tree is scanning — smooth and readable, never disruptive.
-	ticker := time.NewTicker(250 * time.Millisecond)
+	ticker := time.NewTicker(time.Duration(Cfg.Performance.RefreshIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
 	currentDir := startDir
@@ -629,10 +656,29 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 	// draw path and all key handlers can reference the same snapshot.
 	var orderedSubFiles []string
 	var displayed []string
+	// pageSize is computed from the live terminal height on every redraw and
+	// stored at loop scope so key handlers always use the same value as the
+	// most recent frame.
+	pageSize := getTerminalPageSize()
+	// lastW/lastH track the terminal dimensions as of the last draw.
+	// The ticker compares against these to detect a resize without using
+	// SIGWINCH, which can interfere with the keyboard package's terminal reads.
+	lastW, lastH, _ := term.GetSize(0)
+	// totalItems tracks the last known length of orderedSubFiles so we can
+	// adjust viewStart immediately when the terminal grows large enough to
+	// show everything without scrolling.
+	totalItems := 0
 
 	for {
 		if needsRedraw {
+			pageSize = getTerminalPageSize()
 			width := getTerminalWidth()
+
+			// If the terminal grew large enough to show all items without
+			// scrolling, reset viewStart so the scroll indicators disappear.
+			if totalItems > 0 && pageSize >= totalItems {
+				viewStart = 0
+			}
 			buf := screenBufPool.Get().(*bytes.Buffer)
 			buf.Reset()
 
@@ -649,12 +695,13 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 			writeDirectoryDetails(buf, currentDir, width)
 
 			orderedSubFiles = getOrderedDirectoryItems(currentDir, orderedSubFiles)
+			totalItems = len(orderedSubFiles)
 			displayed = displayed[:0]
 			if viewStart > 0 {
 				displayed = append(displayed, "...")
 			}
 			start := viewStart
-			end := min(viewStart+20, len(orderedSubFiles))
+			end := min(viewStart+pageSize, len(orderedSubFiles))
 			for i := start; i < end; i++ {
 				displayed = append(displayed, orderedSubFiles[i])
 			}
@@ -676,7 +723,8 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 			needsRedraw = false
 		}
 
-		// Wait for a keypress or a ticker-driven background refresh.
+		// Wait for a keypress, a ticker-driven background refresh, or a
+		// terminal resize signal.
 		var key keyboard.Key
 		select {
 		case event, ok := <-keyCh:
@@ -689,12 +737,24 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 			key = event.Key
 			needsRedraw = true
 		case <-ticker.C:
-			// Only repaint if finalizeDirectory has written new sizes since the
-			// last draw.  CompareAndSwap atomically clears the flag so we do not
-			// redraw again until the next batch of completions arrives.
+			// Check for a terminal resize by comparing current dimensions to the
+			// last known ones.  This avoids SIGWINCH entirely — the signal can
+			// interrupt the keyboard package's blocking read and crash the program.
+			// 250 ms lag on resize is imperceptible to the user.
+			w, h, err := term.GetSize(0)
+			if err == nil && (w != lastW || h != lastH) {
+				lastW, lastH = w, h
+				needsRedraw = true
+			}
+			// Also repaint if finalizeDirectory has written new sizes.
 			if atomic.CompareAndSwapInt32(&displayDirty, 1, 0) {
 				needsRedraw = true
 			}
+			continue
+		}
+
+		// Nothing to navigate if the listing is empty.
+		if len(displayed) == 0 {
 			continue
 		}
 
@@ -715,7 +775,7 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 				selected++
 			} else if displayed[selected] == "..." {
 				// Do nothing
-			} else if viewStart+20 < len(orderedSubFiles) {
+			} else if viewStart+pageSize < len(orderedSubFiles) {
 				viewStart += 1
 			}
 			if selected > len(displayed)-1 {
@@ -828,26 +888,47 @@ func writeDirectoryDetails(buf *bytes.Buffer, Dir *Directory, width int) {
 	if Dir.Unreadable {
 		color = tc.Gray
 	}
-	plainName := Dir.Name + string(os.PathSeparator)
-	maxNameLen := width - 50
-	if len(plainName) > maxNameLen && maxNameLen > 3 {
-		plainName = plainName[:maxNameLen-3] + "..."
-	} else if len(plainName) > maxNameLen {
-		plainName = "..."
-	}
 
+	// Read values under lock first so we can measure their rendered widths
+	// before deciding how many characters the name column can use.
 	Dir.mu.RLock()
 	subCount := Dir.SubObjectCount
 	dirSize := Dir.Size
 	Dir.mu.RUnlock()
 
+	countStr := fmt.Sprint(subCount)
+	sizeStr := AutoSize(dirSize)
+
+	// Visible metadata width (no ANSI codes):
+	//   "  "       2  — selection prefix added by writeSortedDirectory
+	//   name       ?  — computed below
+	//   " " count  1 + len(countStr)
+	//   " " perms  1 + len(Dir.Permissions)
+	//   " " owner  1 + len(Dir.Owner)
+	//   ":" group  1 + len(Dir.Group)
+	//   " " size   1 + len(sizeStr)
+	metaWidth := 2 + 1 + len(countStr) + 1 + len(Dir.Permissions) + 1 + len(Dir.Owner) + 1 + len(Dir.Group) + 1 + len(sizeStr)
+	maxNameLen := width - metaWidth
+	if maxNameLen < 4 {
+		maxNameLen = 4
+	}
+
+	plainName := Dir.Name + string(os.PathSeparator)
+	if len(plainName) > maxNameLen {
+		if maxNameLen > 3 {
+			plainName = plainName[:maxNameLen-3] + "..."
+		} else {
+			plainName = "..."
+		}
+	}
+
 	fmt.Fprintf(buf, "%s %s %s %s:%s %s",
 		colors.SetColor(plainName, color),
-		colors.SetColor(fmt.Sprint(subCount), tc.Crimson),
+		colors.SetColor(countStr, tc.Crimson),
 		colors.SetColor(Dir.Permissions, tc.Gold),
 		colors.SetColor(Dir.Owner, tc.VibrantPink),
 		colors.SetColor(Dir.Group, tc.Fuchsia),
-		colors.SetColor(AutoSize(dirSize), tc.SeaGreen),
+		colors.SetColor(sizeStr, tc.SeaGreen),
 	)
 	if Dir.Target != "" {
 		fmt.Fprintf(buf, " -> %s", colors.SetColor(Dir.Target, tc.Orange))
@@ -861,12 +942,29 @@ func writeFileDetails(buf *bytes.Buffer, fileInfo *FileInfo, width int) {
 	if fileInfo.Unreadable {
 		color = tc.Gray
 	}
+
+	sizeStr := AutoSize(fileInfo.Size)
+
+	// Visible metadata width (no ANSI codes):
+	//   "  "       2  — selection prefix
+	//   name       ?  — computed below
+	//   " " perms  1 + len(fileInfo.Permissions)
+	//   " " owner  1 + len(fileInfo.Owner)
+	//   ":" group  1 + len(fileInfo.Group)
+	//   " " size   1 + len(sizeStr)
+	metaWidth := 2 + 1 + len(fileInfo.Permissions) + 1 + len(fileInfo.Owner) + 1 + len(fileInfo.Group) + 1 + len(sizeStr)
+	maxNameLen := width - metaWidth
+	if maxNameLen < 4 {
+		maxNameLen = 4
+	}
+
 	plainName := fileInfo.Name
-	maxNameLen := width - 40
-	if len(plainName) > maxNameLen && maxNameLen > 3 {
-		plainName = plainName[:maxNameLen-3] + "..."
-	} else if len(plainName) > maxNameLen {
-		plainName = "..."
+	if len(plainName) > maxNameLen {
+		if maxNameLen > 3 {
+			plainName = plainName[:maxNameLen-3] + "..."
+		} else {
+			plainName = "..."
+		}
 	}
 
 	fmt.Fprintf(buf, "%s %s %s:%s %s",
@@ -874,7 +972,7 @@ func writeFileDetails(buf *bytes.Buffer, fileInfo *FileInfo, width int) {
 		colors.SetColor(fileInfo.Permissions, tc.Gold),
 		colors.SetColor(fileInfo.Owner, tc.VibrantPink),
 		colors.SetColor(fileInfo.Group, tc.Fuchsia),
-		colors.SetColor(AutoSize(fileInfo.Size), tc.SeaGreen),
+		colors.SetColor(sizeStr, tc.SeaGreen),
 	)
 	if fileInfo.Target != "" {
 		fmt.Fprintf(buf, " -> %s", colors.SetColor(fileInfo.Target, tc.Orange))
