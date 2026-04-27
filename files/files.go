@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/chzyer/readline"
@@ -33,73 +34,175 @@ var directoryCache = make(map[string]*Directory)
 var cacheMutex sync.RWMutex
 var logLevel = "error"
 
-// Worker pool for concurrent directory processing
 const numWorkers = 32
 
-type WorkItem struct {
-	dir      *Directory
-	fsidDev  [2]int32 // filesystem ID to detect mount points
-	resultCh chan WorkResult
-}
+// scanSem bounds the number of concurrent directory-scan goroutines.
+// Released by each goroutine before it spawns its children, so there is no deadlock.
+var scanSem = make(chan struct{}, numWorkers)
 
-type WorkResult struct {
-	size  int64
-	count int64
-	err   error
-}
-
-var (
-	workerPool *WorkerPool
-	poolOnce   sync.Once
-)
-
-type WorkerPool struct {
-	workQueue chan WorkItem
-	wg        sync.WaitGroup
-}
-
-func init() {
-	// Initialize worker pool on package load
-	poolOnce.Do(func() {
-		workerPool = NewWorkerPool(numWorkers)
-	})
-}
-
-func NewWorkerPool(numWorkers int) *WorkerPool {
-	pool := &WorkerPool{
-		workQueue: make(chan WorkItem, numWorkers*2), // buffer for smooth dispatch
+// scanDirectory scans exactly one directory level: populates dir.Files,
+// dir.Subdirectories, and dir.SubObjectCount, then spawns bounded goroutines
+// for each subdirectory that lives on the same filesystem.
+//
+// The caller must have already acquired one slot from scanSem.
+// scanDirectory releases that slot before it returns so that child goroutines
+// can acquire their own slots without deadlocking.
+//
+// When the last child finishes it calls finalizeDirectory, which rolls sizes
+// up the tree bottom-to-top.  BuildDirectoryStructure returns as soon as the
+// first level is populated; all deeper work happens in the background.
+func scanDirectory(dir *Directory, fsidDev [2]int32) {
+	entries, err := os.ReadDir(dir.FullPath)
+	if err != nil {
+		dir.Unreadable = true
+		<-scanSem
+		finalizeDirectory(dir)
+		return
 	}
 
-	pool.wg.Add(numWorkers)
-	for i := 0; i < numWorkers; i++ {
-		go pool.worker()
+	var needsScan []*Directory
+
+	for _, entry := range entries {
+		fullPath := filepath.Clean(filepath.Join(dir.FullPath, entry.Name()))
+		fi, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		// Symlink – record target, no recursion
+		if fi.Mode()&os.ModeSymlink != 0 {
+			target, _ := os.Readlink(fullPath)
+			dir.mu.Lock()
+			dir.Files[entry.Name()] = &FileInfo{
+				Name:        fi.Name(),
+				Permissions: fmt.Sprintf("%o", fi.Mode().Perm()),
+				Owner:       GetOwner(fi),
+				Group:       GetGroup(fi),
+				Size:        0,
+				ModTime:     fi.ModTime().Unix(),
+				FullPath:    fullPath,
+				Target:      target,
+				Parent:      dir,
+			}
+			dir.mu.Unlock()
+			continue
+		}
+
+		if fi.IsDir() {
+			subDir, err := ParseDirectory(fullPath, dir)
+			if err != nil {
+				if logLevel == "warn" {
+					fmt.Printf("ParseDirectory failed for %s: %v\n", fullPath, err)
+				}
+				continue
+			}
+
+			dir.mu.Lock()
+			dir.Subdirectories[entry.Name()] = subDir
+			dir.mu.Unlock()
+
+			// Stay on the same filesystem – skip mount points
+			var subStat unix.Statfs_t
+			if err := unix.Statfs(fullPath, &subStat); err != nil {
+				subDir.Unreadable = true
+				// Treat as a leaf with size 0; finalizeDirectory handles it
+				continue
+			}
+			if subStat.Fsid.Val[0] != fsidDev[0] || subStat.Fsid.Val[1] != fsidDev[1] {
+				// Mount point: leave Size=0, do not recurse
+				continue
+			}
+
+			needsScan = append(needsScan, subDir)
+			continue
+		}
+
+		// Regular file
+		pfile, err := ParseFile(fullPath, dir)
+		if err != nil {
+			pfile = &FileInfo{
+				Name:       fi.Name(),
+				FullPath:   fullPath,
+				Unreadable: true,
+				Parent:     dir,
+			}
+		}
+		dir.mu.Lock()
+		dir.Files[entry.Name()] = pfile
+		dir.mu.Unlock()
 	}
 
-	return pool
-}
+	dir.mu.Lock()
+	dir.SubObjectCount = int64(len(entries))
+	dir.mu.Unlock()
 
-func (p *WorkerPool) worker() {
-	defer p.wg.Done()
-	for item := range p.workQueue {
-		result := p.processDirectory(item.dir, item.fsidDev)
-		item.resultCh <- result
+	// Release our semaphore slot BEFORE trying to acquire slots for children.
+	// If we held it while blocking on child slots we would deadlock when the
+	// pool is saturated.
+	<-scanSem
+
+	if len(needsScan) == 0 {
+		finalizeDirectory(dir)
+		return
+	}
+
+	// pendingChildren must be stored before any child goroutine starts so
+	// that a fast-finishing child never decrements below the final count.
+	atomic.StoreInt32(&dir.pendingChildren, int32(len(needsScan)))
+
+	for _, sd := range needsScan {
+		sd := sd
+		go func() {
+			scanSem <- struct{}{} // acquire slot (blocks if pool is saturated)
+			scanDirectory(sd, fsidDev)
+		}()
 	}
 }
 
-func (p *WorkerPool) processDirectory(dir *Directory, fsidDev [2]int32) WorkResult {
-	size, count, err := buildDirectoryRecursionInternal(dir, fsidDev)
-	return WorkResult{size: size, count: count, err: err}
-}
+// finalizeDirectory is called exactly once per directory, after every
+// descendant has been scanned.  It computes the recursive size from the
+// completed subtree, writes it under the directory's own lock, and
+// decrements the parent's pendingChildren counter.  When the counter
+// reaches zero the parent finalizes itself, and so on up to the root.
+func finalizeDirectory(dir *Directory) {
+	dirInfo, err := os.Stat(dir.FullPath)
+	var total int64
+	if err == nil {
+		total = dirInfo.Size()
+	}
 
-func (p *WorkerPool) Submit(dir *Directory, fsidDev [2]int32) chan WorkResult {
-	resultCh := make(chan WorkResult, 1)
-	p.workQueue <- WorkItem{dir: dir, fsidDev: fsidDev, resultCh: resultCh}
-	return resultCh
-}
+	dir.mu.RLock()
+	for _, f := range dir.Files {
+		if !f.Unreadable {
+			total += f.Size
+		}
+	}
+	for _, sd := range dir.Subdirectories {
+		// Each sd.Size was written by its own finalizeDirectory call, which
+		// happened-before this point (guaranteed by the pendingChildren atomic).
+		sd.mu.RLock()
+		total += sd.Size
+		sd.mu.RUnlock()
+	}
+	dir.mu.RUnlock()
 
-func (p *WorkerPool) Shutdown() {
-	close(p.workQueue)
-	p.wg.Wait()
+	dir.mu.Lock()
+	dir.Size = total
+	dir.mu.Unlock()
+
+	atomic.StoreInt32(&dir.scanComplete, 1)
+
+	// Notify parent under dir's lock so that preloadParentAndSiblings can
+	// atomically set Parent and read scanComplete without missing an update.
+	dir.mu.Lock()
+	parent := dir.FileInfo.Parent
+	dir.mu.Unlock()
+
+	if parent != nil {
+		if atomic.AddInt32(&parent.pendingChildren, -1) == 0 {
+			finalizeDirectory(parent)
+		}
+	}
 }
 
 func getTerminalWidth() int {
@@ -160,154 +263,41 @@ func ParseDirectory(path string, parent *Directory) (*Directory, error) {
 	return dir, nil
 }
 
-// BuildDirectoryStructure initializes the population of the directory structure from the dirPath
+// BuildDirectoryStructure scans the first level of dirPath synchronously so
+// the caller has an immediately-usable directory listing, then returns.
+// All deeper subdirectories are scanned in background goroutines.  Sizes
+// start at zero and are updated in-place as subtrees complete; the display
+// loop will show correct values on the next redraw after each subtree finishes.
 func BuildDirectoryStructure(dirPath string) (*Directory, error) {
 	defer t.Timer()()
+
 	startDir, err := ParseDirectory(dirPath, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	//if Root == nil {
-	//	return fmt.Errorf("root directory is not set")
-	//}
+	if err := BuildDirectoryRecursion(startDir); err != nil {
+		return nil, err
+	}
 
-	startDir.Size, startDir.SubObjectCount, err = BuildDirectoryRecursion(startDir)
-
-	// Cache the built directory and its subdirectories
 	cacheDirectoryTree(startDir)
-
 	return startDir, nil
 }
 
-// BuildDirectoryRecursion builds directory structure recursively using worker pool for parallelization
-func BuildDirectoryRecursion(dir *Directory) (int64, int64, error) {
+// BuildDirectoryRecursion kicks off the two-phase scan+finalize process for
+// dir.  It acquires one semaphore slot, calls scanDirectory (which releases
+// the slot and spawns children before returning), and returns as soon as the
+// first level is populated.  Sizes propagate up automatically via
+// finalizeDirectory once each subtree is complete.
+func BuildDirectoryRecursion(dir *Directory) error {
 	var currentStat unix.Statfs_t
-	err := unix.Statfs(dir.FullPath, &currentStat)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to statfs directory %s: %w", dir.FullPath, err)
-	}
-	dev := currentStat.Fsid.Val
-
-	return buildDirectoryRecursiveWithPool(dir, dev)
-}
-
-// buildDirectoryRecursiveWithPool processes directory immediately, queues subdirectories asynchronously
-func buildDirectoryRecursiveWithPool(dir *Directory, fsidDev [2]int32) (int64, int64, error) {
-	dirEntries, err := os.ReadDir(dir.FullPath)
-	if err != nil {
-		dir.Unreadable = true
-		if logLevel == "warn" {
-			fmt.Printf("Failed to read directory: %s, error: %v\n", dir.FullPath, err)
-		}
-		return 0, 0, nil
+	if err := unix.Statfs(dir.FullPath, &currentStat); err != nil {
+		return fmt.Errorf("failed to statfs directory %s: %w", dir.FullPath, err)
 	}
 
-	var totalSize int64
-	var totalCount int64
-
-	// First pass: populate immediate children without waiting
-	for _, entry := range dirEntries {
-		totalCount++
-		fullPath := filepath.Clean(filepath.Join(dir.FullPath, entry.Name()))
-		fi, err := entry.Info()
-
-		if err != nil {
-			continue
-		}
-
-		// Handle symlinks
-		if fi.Mode()&os.ModeSymlink != 0 {
-			target, err := os.Readlink(fullPath)
-			if err != nil {
-				continue
-			}
-			dir.Files[entry.Name()] = &FileInfo{
-				Name:        fi.Name(),
-				Permissions: fmt.Sprintf("%o", fi.Mode().Perm()),
-				Owner:       GetOwner(fi),
-				Group:       GetGroup(fi),
-				Size:        0,
-				ModTime:     fi.ModTime().Unix(),
-				FullPath:    fullPath,
-				Target:      target,
-			}
-			continue
-		}
-
-		// Handle directories - parse but don't recurse
-		if fi.IsDir() {
-			subDir, err := ParseDirectory(fullPath, dir)
-			if err != nil {
-				subDir = &Directory{
-					FileInfo: FileInfo{
-						Name:        fi.Name(),
-						Permissions: "",
-						Owner:       "",
-						Group:       "",
-						Size:        0,
-						ModTime:     fi.ModTime().Unix(),
-						FullPath:    fullPath,
-						Unreadable:  true,
-					},
-					Subdirectories: make(map[string]*Directory),
-					Files:          make(map[string]*FileInfo),
-				}
-			}
-
-			var subStat unix.Statfs_t
-			err = unix.Statfs(fullPath, &subStat)
-			if err != nil {
-				subDir.Unreadable = true
-				subDir.Size = 0
-			} else if subStat.Fsid.Val[0] != fsidDev[0] || subStat.Fsid.Val[1] != fsidDev[1] {
-				// Mount point, don't recurse
-				subDir.Size = 0
-			} else {
-				// Queue subdirectory for async processing - DON'T WAIT
-				go func(subDir *Directory) {
-					resultCh := workerPool.Submit(subDir, fsidDev)
-					<-resultCh // Consume result but don't block
-				}(subDir)
-			}
-
-			dir.Subdirectories[entry.Name()] = subDir
-			continue
-		}
-
-		// Handle files
-		pfile, err := ParseFile(fullPath, dir)
-		if err != nil {
-			pfile = &FileInfo{
-				Name:        fi.Name(),
-				Permissions: "",
-				Owner:       "",
-				Group:       "",
-				Size:        0,
-				ModTime:     0,
-				FullPath:    fullPath,
-				Unreadable:  true,
-			}
-		}
-		dir.Files[entry.Name()] = pfile
-		if !pfile.Unreadable {
-			totalSize += fi.Size()
-		}
-	}
-
-	// Calculate directory info immediately (no subdirectory recursion)
-	dirInfo, err := os.Stat(dir.FullPath)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to stat directory %s: %w", dir.FullPath, err)
-	}
-	dir.Size = totalSize + dirInfo.Size()
-	dir.SubObjectCount = totalCount
-	return totalSize, totalCount, nil
-}
-
-// buildDirectoryRecursionInternal is called by worker pool - processes directory fully recursively
-func buildDirectoryRecursionInternal(dir *Directory, fsidDev [2]int32) (int64, int64, error) {
-	return buildDirectoryRecursiveWithPool(dir, fsidDev)
+	scanSem <- struct{}{}
+	scanDirectory(dir, currentStat.Fsid.Val)
+	return nil
 }
 
 // cacheDirectoryTree recursively caches a directory and all its subdirectories
@@ -315,19 +305,28 @@ func cacheDirectoryTree(dir *Directory) {
 	cacheMutex.Lock()
 	directoryCache[dir.FullPath] = dir
 	cacheMutex.Unlock()
-	for _, subDir := range dir.Subdirectories {
+
+	// Read subdirectories under lock
+	dir.mu.RLock()
+	subdirs := dir.Subdirectories
+	dir.mu.RUnlock()
+
+	for _, subDir := range subdirs {
 		cacheDirectoryTree(subDir)
 	}
 }
 
-// preloadParentAndSiblings asynchronously loads parent directory and all its siblings
+// preloadParentAndSiblings asynchronously loads the parent directory so that
+// navigating upward feels instant.  It reuses the existing currentDir object
+// (already scanned) rather than re-scanning it, and correctly wires it into
+// the parent's pendingChildren accounting so that the parent's size finalizes
+// as soon as all sibling scans complete.
 func preloadParentAndSiblings(currentDir *Directory) {
 	parentPath := filepath.Dir(currentDir.FullPath)
 	if parentPath == currentDir.FullPath || parentPath == "." {
 		return
 	}
 
-	// Check if already cached
 	cacheMutex.RLock()
 	_, exists := directoryCache[parentPath]
 	cacheMutex.RUnlock()
@@ -336,29 +335,134 @@ func preloadParentAndSiblings(currentDir *Directory) {
 	}
 
 	go func() {
+		var parentStat unix.Statfs_t
+		if err := unix.Statfs(parentPath, &parentStat); err != nil {
+			return
+		}
+		fsidDev := parentStat.Fsid.Val
+
 		parentDir, err := ParseDirectory(parentPath, nil)
 		if err != nil {
 			return
 		}
 
-		// Build full parent directory structure with batching
-		if _, _, err := BuildDirectoryRecursion(parentDir); err != nil {
+		// Scan the parent's first level manually so we can intercept the
+		// entry that corresponds to currentDir and reuse the existing object.
+		entries, err := os.ReadDir(parentPath)
+		if err != nil {
+			parentDir.Unreadable = true
 			return
 		}
 
-		// Link current directory to parent if not already linked
-		if currentDir.Parent == nil {
-			parentDir.Subdirectories[currentDir.Name] = currentDir
-			currentDir.Parent = parentDir
+		var needsScan []*Directory // siblings that require a fresh scan
+
+		for _, entry := range entries {
+			fullPath := filepath.Clean(filepath.Join(parentPath, entry.Name()))
+			fi, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			if fi.Mode()&os.ModeSymlink != 0 {
+				target, _ := os.Readlink(fullPath)
+				parentDir.mu.Lock()
+				parentDir.Files[entry.Name()] = &FileInfo{
+					Name:        fi.Name(),
+					Permissions: fmt.Sprintf("%o", fi.Mode().Perm()),
+					Owner:       GetOwner(fi),
+					Group:       GetGroup(fi),
+					ModTime:     fi.ModTime().Unix(),
+					FullPath:    fullPath,
+					Target:      target,
+					Parent:      parentDir,
+				}
+				parentDir.mu.Unlock()
+				continue
+			}
+
+			if fi.IsDir() {
+				if fullPath == currentDir.FullPath {
+					// Reuse the already-scanned directory; do not scan again.
+					parentDir.mu.Lock()
+					parentDir.Subdirectories[entry.Name()] = currentDir
+					parentDir.mu.Unlock()
+					continue
+				}
+
+				sd, err := ParseDirectory(fullPath, parentDir)
+				if err != nil {
+					continue
+				}
+				parentDir.mu.Lock()
+				parentDir.Subdirectories[entry.Name()] = sd
+				parentDir.mu.Unlock()
+
+				var subStat unix.Statfs_t
+				if err := unix.Statfs(fullPath, &subStat); err != nil {
+					sd.Unreadable = true
+					continue
+				}
+				if subStat.Fsid.Val[0] != fsidDev[0] || subStat.Fsid.Val[1] != fsidDev[1] {
+					continue // mount point, leave Size=0
+				}
+				needsScan = append(needsScan, sd)
+				continue
+			}
+
+			pfile, err := ParseFile(fullPath, parentDir)
+			if err != nil {
+				pfile = &FileInfo{Name: fi.Name(), FullPath: fullPath, Unreadable: true, Parent: parentDir}
+			}
+			parentDir.mu.Lock()
+			parentDir.Files[entry.Name()] = pfile
+			parentDir.mu.Unlock()
 		}
 
-		// Cache the parent and all its subdirectories
+		parentDir.mu.Lock()
+		parentDir.SubObjectCount = int64(len(entries))
+		parentDir.mu.Unlock()
+
+		// pendingChildren counts siblings that need scanning, plus one slot
+		// reserved for currentDir (handled below).  We set this BEFORE writing
+		// currentDir.Parent so that if currentDir's finalizeDirectory call races
+		// with us it will always see a valid counter.
+		pendingCount := int32(len(needsScan)) + 1 // +1 for currentDir
+		atomic.StoreInt32(&parentDir.pendingChildren, pendingCount)
+
+		// Atomically link currentDir to parentDir and check whether its scan
+		// has already completed.  The lock on currentDir.mu is the same one
+		// that finalizeDirectory holds when it reads Parent, so one of two
+		// outcomes is guaranteed:
+		//   a) We write Parent first → finalizeDirectory will decrement parentDir.pendingChildren.
+		//   b) finalizeDirectory ran first (scanComplete==1) → we decrement manually below.
+		currentDir.mu.Lock()
+		currentDir.FileInfo.Parent = parentDir
+		alreadyDone := atomic.LoadInt32(&currentDir.scanComplete) == 1
+		currentDir.mu.Unlock()
+
+		if alreadyDone {
+			// finalizeDirectory already ran with Parent==nil; manually consume its slot.
+			if atomic.AddInt32(&parentDir.pendingChildren, -1) == 0 {
+				finalizeDirectory(parentDir)
+			}
+		}
+		// If not done, currentDir's own finalizeDirectory will decrement when it finishes.
+
+		// Spawn bounded goroutines for siblings.
+		for _, sd := range needsScan {
+			sd := sd
+			go func() {
+				scanSem <- struct{}{}
+				scanDirectory(sd, fsidDev)
+			}()
+		}
+
 		cacheMutex.Lock()
 		directoryCache[parentPath] = parentDir
 		cacheMutex.Unlock()
 		cacheDirectoryTree(parentDir)
 
-		// Preload grandparent level in batches
+		// Kick off grandparent preload
 		grandParentPath := filepath.Dir(parentPath)
 		if grandParentPath != parentPath && grandParentPath != "." {
 			cacheMutex.RLock()
@@ -367,7 +471,7 @@ func preloadParentAndSiblings(currentDir *Directory) {
 			if !exists {
 				grandParent, err := ParseDirectory(grandParentPath, nil)
 				if err == nil {
-					if _, _, err := BuildDirectoryRecursion(grandParent); err == nil {
+					if err := BuildDirectoryRecursion(grandParent); err == nil {
 						cacheMutex.Lock()
 						directoryCache[grandParentPath] = grandParent
 						cacheMutex.Unlock()
@@ -550,7 +654,7 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 					if !exists {
 						// Parent not cached, recalculate and cache it asynchronously
 						go func(parent *Directory, path string) {
-							if _, _, err := BuildDirectoryRecursion(parent); err == nil {
+							if err := BuildDirectoryRecursion(parent); err == nil {
 								cacheMutex.Lock()
 								directoryCache[path] = parent
 								cacheMutex.Unlock()
@@ -582,7 +686,7 @@ func DisplayDirectoryNavigation(startDir *Directory) (*Directory, *FileInfo, err
 						parentDir, err := ParseDirectory(parentPath, nil)
 						if err == nil {
 							// Synchronously populate parent with all immediate contents
-							if _, _, err := BuildDirectoryRecursion(parentDir); err == nil {
+							if err := BuildDirectoryRecursion(parentDir); err == nil {
 								// Set current dir as child of parent
 								parentDir.Subdirectories[currentDir.Name] = currentDir
 								currentDir.Parent = parentDir
@@ -639,11 +743,18 @@ func displayDirectoryDetails(Dir *Directory, width int) string {
 		plainName = "..."
 	}
 	colorDirName := colors.SetColor(plainName, color)
-	colorSubObjectCount := colors.SetColor(fmt.Sprint(Dir.SubObjectCount), tc.Crimson)
+
+	// Read Size and SubObjectCount under lock
+	Dir.mu.RLock()
+	subCount := Dir.SubObjectCount
+	dirSize := Dir.Size
+	Dir.mu.RUnlock()
+
+	colorSubObjectCount := colors.SetColor(fmt.Sprint(subCount), tc.Crimson)
 	colorDirOctal := colors.SetColor(Dir.Permissions, tc.Gold)
 	colorDirOwner := colors.SetColor(Dir.Owner, tc.VibrantPink)
 	colorDirGroup := colors.SetColor(Dir.Group, tc.Fuchsia)
-	colorDirSize := colors.SetColor(AutoSize(Dir.Size), tc.SeaGreen)
+	colorDirSize := colors.SetColor(AutoSize(dirSize), tc.SeaGreen)
 	colorTarget := ""
 	if Dir.Target != "" {
 		colorTarget = colors.SetColor(fmt.Sprintf(" -> %s", Dir.Target), tc.Orange)
@@ -780,8 +891,13 @@ func Deletion(file *FileInfo, details string, isDir bool) error {
 		delete(file.Parent.Subdirectories, file.Name)
 	}
 
-	updateParentSizes(file.Parent, -1*file.Size)
-	updateParentCount(file.Parent, -1)
+	removedSize := file.Size
+	for d := file.Parent; d != nil; d = d.FileInfo.Parent {
+		d.mu.Lock()
+		d.Size -= removedSize
+		d.SubObjectCount--
+		d.mu.Unlock()
+	}
 
 	return nil
 }
@@ -896,21 +1012,6 @@ func CopyingFolder(selectedDir *Directory) {
 	if err != nil {
 		println(err.Error())
 	}
-	//why not use BuildDirectoryStructure?
-	//newDir := Directory{
-	//	FileInfo: FileInfo{
-	//		Name: filepath.Base(copyPath),
-	//		Permissions: selectedDir.Permissions,
-	//		Owner: selectedDir.Owner,
-	//		Group: selectedDir.Group,
-	//		Size: selectedDir.Size,
-	//		ModTime: time.Now().,
-	//	}
-	//	SubObjectCount: selectedDir.SubObjectCount,
-	//	Files: make(map[string]FileInfo),
-	//	Subdirectories: make(map[string]*Directory),
-	//
-	//}
 
 }
 
@@ -1136,7 +1237,12 @@ func updateFileSystem(file *FileInfo, newPath string) {
 	newFile.Parent = targetDir
 	targetDir.Files[newFile.Name] = newFile
 	targetDir.SubObjectCount++
-	updateParentSizes(targetDir, newFile.Size)
+	addedSize := newFile.Size
+	for d := targetDir; d != nil; d = d.FileInfo.Parent {
+		d.mu.Lock()
+		d.Size += addedSize
+		d.mu.Unlock()
+	}
 
 }
 
@@ -1151,23 +1257,6 @@ func findTargetDirectory(targetPath string, dir *Directory) *Directory {
 		}
 	}
 	return nil
-}
-
-//func update() {
-//	updateParentSizes(file.Parent, -1*file.Size)
-//	updateParentCount(filepath.HasPre)
-//}
-
-func updateParentCount(dir *Directory, fileCount int64) {
-	for currentDir := dir; currentDir != nil; currentDir = currentDir.Parent {
-		currentDir.SubObjectCount += fileCount
-	}
-}
-
-func updateParentSizes(dir *Directory, fileSize int64) {
-	for currentDir := dir; currentDir != nil; currentDir = currentDir.Parent {
-		currentDir.Size += fileSize
-	}
 }
 
 //todo remove old code
@@ -1199,11 +1288,6 @@ func printDirectory(dir *Directory, level int) {
 	colorDSize := colors.SetColor(AutoSize(dir.Size), tc.SeaGreen)
 
 	fmt.Printf("%s%s %s %s:%s %s\n", indent, colorDirName, colorDirOctal, colorDOwner, colorDGroup, colorDSize)
-
-	//// Iterate through links and print them
-	//for linkName, linkInfo := range dir.Links {
-	//	fmt.Printf("%s  L:%s/%s %s %s:%s %s\n", indent, dir.Name, linkName, linkInfo.Permissions, linkInfo.Owner, linkInfo.Group, linkInfo.Size)
-	//}
 
 	// Iterate through files and print the
 

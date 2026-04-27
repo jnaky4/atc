@@ -1,15 +1,8 @@
 package files
 
-var Root *Directory
+import "sync"
 
-//type FileSystem interface {
-//	GetOwner(fi os.FileInfo) string
-//	GetGroup(fi os.FileInfo) string
-//	displayFileDetails(fileInfo FileInfo)
-//}
-//
-//type DirectorySystem interface {
-//}
+var Root *Directory
 
 type FileInfo struct {
 	Name        string
@@ -26,9 +19,12 @@ type FileInfo struct {
 
 type Directory struct {
 	FileInfo
-	Subdirectories map[string]*Directory
-	Files          map[string]*FileInfo
-	SubObjectCount int64
+	Subdirectories  map[string]*Directory
+	Files           map[string]*FileInfo
+	SubObjectCount  int64
+	mu              sync.RWMutex // Protect Size, SubObjectCount, and map access
+	pendingChildren int32        // atomic: number of child scans still outstanding
+	scanComplete    int32        // atomic: 1 once finalizeDirectory has run for this dir
 }
 
 type Volume struct {
